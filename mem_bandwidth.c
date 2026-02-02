@@ -1,91 +1,114 @@
 // mem_bandwidth.c
 // 简单内存带宽测试工具（约100MB工作集）
-// 编译: gcc -O3 -march=native mem_bandwidth.c -o mem_bandwidth -lrt
+// 编译: gcc -O3 mem_bandwidth.c -o mem_bandwidth -lrt -march=armv7-a -mcpu=cortex-a9 -mfpu=vfpv3-d16 -mfloat-abi=hard
 // 运行: ./mem_bandwidth
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include <unistd.h>
 
-#define SIZE_MB         100                  // 测试内存大小（MiB）
-#define BYTES_TOTAL     ((size_t)SIZE_MB * 1024 * 1024)  // 104857600 bytes
-#define ITERATIONS      20                   // 每项测试重复次数（减少测量误差）
+#define SIZE_MB         100
+#define BYTES_TOTAL     ((size_t)SIZE_MB * 1024 * 1024)
+#define ITERATIONS      20
 
-// 高精度计时
-static inline double get_time_sec(void)
-{
+static inline double get_time_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-// 顺序读测试
-double test_read(const char *buf, size_t size)
-{
+// 优化后的读测试：使用指针步进，减少数据依赖
+double test_read(const char *buf, size_t size) {
     double start = get_time_sec();
-    volatile uint64_t sink = 0;  // 防止编译器优化掉读操作
+    volatile uint64_t sink = 0;
     for (int i = 0; i < ITERATIONS; i++) {
-        for (size_t j = 0; j < size; j += 64) {  // 64字节对齐，模拟缓存行
-            sink += ((uint64_t*)buf)[j / 8];
+        const uint64_t *ptr = (const uint64_t *)buf;
+        size_t n = size / sizeof(uint64_t);
+        // 展开循环，减少分支开销
+        for (size_t j = 0; j < n; j += 8) {
+            sink += ptr[j];
+            sink += ptr[j+1];
+            sink += ptr[j+2];
+            sink += ptr[j+3];
+            sink += ptr[j+4];
+            sink += ptr[j+5];
+            sink += ptr[j+6];
+            sink += ptr[j+7];
         }
     }
     double end = get_time_sec();
-    (void)sink;  // 避免未使用警告
+    (void)sink;
     return (double)ITERATIONS * size / (end - start);
 }
 
-// 顺序写测试
-double test_write(char *buf, size_t size)
-{
+double test_write(char *buf, size_t size) {
     double start = get_time_sec();
     for (int i = 0; i < ITERATIONS; i++) {
-        memset(buf, (char)i, size);  // 用不同值防止零页优化
+        // 使用汇编层优化的 memset
+        memset(buf, (int)i, size);
     }
     double end = get_time_sec();
     return (double)ITERATIONS * size / (end - start);
 }
 
-// 顺序拷贝测试（memcpy）
-double test_copy(const char *src, char *dst, size_t size)
-{
+double test_copy(const char *src, char *dst, size_t size) {
     double start = get_time_sec();
     for (int i = 0; i < ITERATIONS; i++) {
-        memcpy(dst, src, size);
+        const uint64_t *s = (const uint64_t *)src;
+        uint64_t *d = (uint64_t *)dst;
+        size_t n = size / 64; // 每次处理 64 字节
+        
+        while(n--) {
+            // 使用内联汇编进行 NEON 拷贝
+            __asm__ __volatile__ (
+                "pld [%0, #128]      \n\t" // 预取前方数据
+                "vld1.8 {d0-d3}, [%0]! \n\t" // 读取 32 字节
+                "vld1.8 {d4-d7}, [%0]! \n\t" // 读取下 32 字节
+                "vst1.8 {d0-d3}, [%1]! \n\t" // 写入 32 字节
+                "vst1.8 {d4-d7}, [%1]! \n\t" // 写入下 32 字节
+                : "+r"(s), "+r"(d)
+                :
+                : "d0","d1","d2","d3","d4","d5","d6","d7","memory"
+            );
+        }
     }
     double end = get_time_sec();
     return (double)ITERATIONS * size / (end - start);
 }
 
-int main(void)
-{
-    printf("内存带宽测试（工作集：%d MiB）\n", SIZE_MB);
-    printf("正在分配内存...\n");
+int main(void) {
+    printf("Zynq-7000 内存带宽测试\n");
 
-    char *buf_a = aligned_alloc(4096, BYTES_TOTAL);
-    char *buf_b = aligned_alloc(4096, BYTES_TOTAL);
-
-    if (!buf_a || !buf_b) {
+    // 使用 posix_memalign 代替 aligned_alloc 以增强 PetaLinux 兼容性
+    void *a, *b;
+    if (posix_memalign(&a, 4096, BYTES_TOTAL) != 0 || 
+        posix_memalign(&b, 4096, BYTES_TOTAL) != 0) {
         perror("内存分配失败");
         return 1;
     }
 
-    // 预热 + 初始化（避免首次访问页面开销）
+    char *buf_a = (char *)a;
+    char *buf_b = (char *)b;
+
     memset(buf_a, 0x55, BYTES_TOTAL);
-    memset(buf_b, 0xaa, BYTES_TOTAL);
+    memset(buf_b, 0xAA, BYTES_TOTAL);
 
-    printf("开始测试（每个项目重复 %d 次）...\n\n", ITERATIONS);
+    printf("开始测试 (工作集: %d MiB, 重复: %d 次)...\n", SIZE_MB, ITERATIONS);
 
-    double read_bw  = test_read(buf_a, BYTES_TOTAL);
-    double write_bw = test_write(buf_b, BYTES_TOTAL);
-    double copy_bw  = test_copy(buf_a, buf_b, BYTES_TOTAL);
+    double rbw = test_read(buf_a, BYTES_TOTAL);
+    double wbw = test_write(buf_b, BYTES_TOTAL);
+    double cbw = test_copy(buf_a, buf_b, BYTES_TOTAL);
 
-    printf("顺序读带宽   : %.2f MB/s\n", read_bw / (1024*1024));
-    printf("顺序写带宽   : %.2f MB/s\n", write_bw / (1024*1024));
-    printf("顺序拷贝带宽 : %.2f MB/s  (约等于读+写)\n", copy_bw / (1024*1024));
+    printf("\n结果汇总:\n");
+    printf("顺序读:   %8.2f MB/s\n", rbw / (1024*1024));
+    printf("顺序写:   %8.2f MB/s\n", wbw / (1024*1024));
+    printf("顺序拷贝: %8.2f MB/s\n", cbw / (1024*1024));
 
-    free(buf_a);
-    free(buf_b);
+    free(a);
+    free(b);
     return 0;
 }
